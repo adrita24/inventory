@@ -115,9 +115,8 @@ def _normalize(text: str) -> list[str]:
     return re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
 
 
-def _fuzzy_match(s1: str, s2: str) -> int:
-    """Simple Levenshtein edit distance."""
-    a, b = s1.lower(), s2.lower()
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein edit distance."""
     if a == b:
         return 0
     m, n = len(a), len(b)
@@ -130,36 +129,58 @@ def _fuzzy_match(s1: str, s2: str) -> int:
     return dp[n]
 
 
-def _name_matches_query(product_name: str, query: str) -> bool:
+def _token_pair_score(qw: str, nw: str) -> float:
     """
-    Return True if the product name is a plausible match for the query.
-    Handles: punctuation, plurals, substrings, and minor typos (edit distance <= 2).
+    Score how well a query token matches a name token.
+    Returns a value in [0, 1]. 0 = no match, 1 = perfect match.
+    Only scores ≥ 0.5 are considered meaningful.
     """
-    q_tokens = _normalize(query)
+    if len(qw) < 3:
+        return 0.0
+
+    qw_s = qw.rstrip("s")
+    nw_s = nw.rstrip("s")
+
+    # Exact / stem match
+    if qw_s == nw_s:
+        return 1.0
+
+    # Substring: shorter must be at least 60% of longer to avoid "co" matching "cocacola"
+    longer = max(len(qw_s), len(nw_s))
+    shorter = min(len(qw_s), len(nw_s))
+    if shorter / longer >= 0.6 and (qw_s in nw_s or nw_s in qw_s):
+        return 0.85
+
+    # Fuzzy: edit distance relative to word length
+    dist = _edit_distance(qw_s, nw_s)
+    max_allowed = 1 if len(qw_s) <= 5 else 2
+    if dist <= max_allowed:
+        return 1.0 - (dist / max(len(qw_s), len(nw_s)))
+
+    return 0.0
+
+
+def _product_match_score(product_name: str, query: str) -> float:
+    """
+    Score a product name against a query in [0, 1].
+    Each meaningful query token must find a good match among name tokens.
+    Returns 0 if any meaningful query token has no match above threshold.
+    """
+    q_tokens = [t for t in _normalize(query) if len(t) >= 3]
     name_tokens = _normalize(product_name)
 
-    if not q_tokens:
-        return False
+    if not q_tokens or not name_tokens:
+        return 0.0
 
+    total = 0.0
     for qw in q_tokens:
-        if len(qw) < 3:  # skip very short words
-            continue
-        qw_stem = qw.rstrip("s")
-        for nw in name_tokens:
-            nw_stem = nw.rstrip("s")
-            # Exact or stem match
-            if qw_stem == nw_stem:
-                return True
-            # Substring: "coca" inside "cocacola" or vice-versa
-            if qw_stem in nw_stem or nw_stem in qw_stem:
-                return True
-            # Fuzzy: allow up to 2 edits for longer words
-            if len(qw) >= 5 and _fuzzy_match(qw, nw) <= 2:
-                return True
-            if len(qw) >= 4 and _fuzzy_match(qw_stem, nw_stem) <= 1:
-                return True
+        best = max((_token_pair_score(qw, nw) for nw in name_tokens), default=0.0)
+        if best < 0.5:
+            # This query token matched nothing — penalise heavily
+            return 0.0
+        total += best
 
-    return False
+    return total / len(q_tokens)
 
 
 def _resolve_product(query: str, session_id: str | None = None,
