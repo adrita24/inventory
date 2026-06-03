@@ -110,101 +110,19 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
-def _normalize(text: str) -> list[str]:
-    """Lowercase, strip punctuation/hyphens, split into tokens."""
-    return re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
-
-
-def _edit_distance(a: str, b: str) -> int:
-    """Levenshtein edit distance."""
-    if a == b:
-        return 0
-    m, n = len(a), len(b)
-    dp = list(range(n + 1))
-    for i in range(1, m + 1):
-        prev = dp[:]
-        dp[0] = i
-        for j in range(1, n + 1):
-            dp[j] = prev[j - 1] if a[i-1] == b[j-1] else 1 + min(prev[j], dp[j-1], prev[j-1])
-    return dp[n]
-
-
-def _token_pair_score(qw: str, nw: str) -> float:
-    """
-    Score how well a query token matches a name token.
-    Returns a value in [0, 1]. 0 = no match, 1 = perfect match.
-    Only scores ≥ 0.5 are considered meaningful.
-    """
-    if len(qw) < 3:
-        return 0.0
-
-    qw_s = qw.rstrip("s")
-    nw_s = nw.rstrip("s")
-
-    # Exact / stem match
-    if qw_s == nw_s:
-        return 1.0
-
-    # Substring: shorter must be at least 60% of longer to avoid "co" matching "cocacola"
-    longer = max(len(qw_s), len(nw_s))
-    shorter = min(len(qw_s), len(nw_s))
-    if shorter / longer >= 0.6 and (qw_s in nw_s or nw_s in qw_s):
-        return 0.85
-
-    # Fuzzy: edit distance relative to word length
-    dist = _edit_distance(qw_s, nw_s)
-    max_allowed = 1 if len(qw_s) <= 5 else 2
-    if dist <= max_allowed:
-        return 1.0 - (dist / max(len(qw_s), len(nw_s)))
-
-    return 0.0
-
-
-def _product_match_score(product_name: str, query: str) -> float:
-    """
-    Score a product name against a query in [0, 1].
-    Each meaningful query token must find a good match among name tokens.
-    Returns 0 if any meaningful query token has no match above threshold.
-    """
-    q_tokens = [t for t in _normalize(query) if len(t) >= 3]
-    name_tokens = _normalize(product_name)
-
-    if not q_tokens or not name_tokens:
-        return 0.0
-
-    total = 0.0
-    for qw in q_tokens:
-        best = max((_token_pair_score(qw, nw) for nw in name_tokens), default=0.0)
-        if best < 0.5:
-            # This query token matched nothing — penalise heavily
-            return 0.0
-        total += best
-
-    return total / len(q_tokens)
-
-
 def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None) -> dict | None:
-    # 1. Explicit query — try keyword search first (exact/substring, most precise)
+    # 1. Explicit query — use RAG + keyword search, refresh from live DB
     if query.strip():
+        hits = rag.retrieve(query, top_k=3)
         kw_hits = inv.search_products(query)
-        if kw_hits:
-            return inv.get_product(kw_hits[0]["product_id"])
-
-        # RAG — only trust if the returned product name actually relates to query
-        rag_hits = rag.retrieve(query, top_k=5)
-        for hit in rag_hits:
-            if _name_matches_query(hit["name"], query):
-                return inv.get_product(hit["product_id"])
-
-        # Full inventory scan with fuzzy name matching (catches typos like "coac cola")
-        all_products = inv.get_all_products()
-        for p in all_products:
-            if _name_matches_query(p["name"], query):
-                return inv.get_product(p["product_id"])
-
-        # Explicit query was given but nothing matched — do NOT fall back to cart/history
-        return None
+        seen_ids = {p["product_id"] for p in hits}
+        for p in kw_hits:
+            if p["product_id"] not in seen_ids:
+                hits.append(p)
+        if hits:
+            # Always refresh from live DB — RAG catalog may have stale quantities
+            return inv.get_product(hits[0]["product_id"])
 
     # 2. No explicit query — scan recent conversation for a product name
     if history:
