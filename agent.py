@@ -24,11 +24,12 @@ INTENT_PROMPT = """You are an intent classifier for a grocery chatbot. Extract t
 Possible intents:
   search        - user wants to find/check a product or category. Extract "query" string.
   list_all      - user wants to see all available products.
-  add_to_cart   - user wants to add a product. Extract "query" string and "quantity" integer.
+  add_to_cart   - user wants to add a specific product. Extract "query" string and "quantity" integer.
+  add_all       - user wants to add ALL products (or the whole inventory/everything) to cart. No query needed.
   remove_from_cart - user wants to remove a product. Extract "query" (product name, empty string if not mentioned) and "quantity" (integer or null -- null means remove all).
   clear_cart    - user wants to empty the cart entirely.
   view_cart     - user wants to see cart contents.
-  place_order   - user wants to checkout / buy everything in cart.
+  place_order   - user wants to checkout / buy everything currently in cart.
   order_history - user wants to see past orders.
   unsupported   - user wants something the system cannot do, e.g. "buy all except X", partial checkout, apply coupon.
   chitchat      - anything else (greetings, random questions unrelated to shopping).
@@ -40,6 +41,9 @@ Rules:
 - "vegetables available" or "show dairy" -> intent: search, query: "vegetables" or "dairy".
 - If the user says "yes" in reply to a suggestion, infer intent from conversation context.
 - "add back", "no add back", "put it back", "add it again" -> intent: add_to_cart, query: "" (system resolves from context).
+- "add everything", "add all products", "add the whole inventory", "add everything to cart" -> intent: add_all.
+- "buy the whole inventory", "order everything", "buy everything" -> intent: add_all (user wants to add all then can place order separately; do NOT map to place_order).
+- IMPORTANT: "buy all" with nothing else = place_order (cart already has items). "buy everything/whole inventory" = add_all (stocking the cart from scratch).
 
 Return exactly this shape (no other text):
 {"intent": "<intent>", "query": "<string>", "quantity": <integer or null>}
@@ -52,6 +56,12 @@ Examples:
 "remove them" -> {"intent": "remove_from_cart", "query": "", "quantity": null}
 "what's in my cart" -> {"intent": "view_cart", "query": "", "quantity": null}
 "buy all" -> {"intent": "place_order", "query": "", "quantity": null}
+"add everything to the cart" -> {"intent": "add_all", "query": "", "quantity": null}
+"add all products" -> {"intent": "add_all", "query": "", "quantity": null}
+"buy the whole inventory" -> {"intent": "add_all", "query": "", "quantity": null}
+"order everything" -> {"intent": "add_all", "query": "", "quantity": null}
+"buy everything" -> {"intent": "add_all", "query": "", "quantity": null}
+"add the whole inventory to my cart" -> {"intent": "add_all", "query": "", "quantity": null}
 "buy all except onions" -> {"intent": "unsupported", "query": "buy all except onions", "quantity": null}
 "my budget is 500" -> {"intent": "unsupported", "query": "my budget is 500", "quantity": null}
 "i have 1000 rupees" -> {"intent": "unsupported", "query": "i have 1000 rupees", "quantity": null}
