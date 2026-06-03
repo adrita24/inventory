@@ -110,11 +110,75 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
+# ---------------------------------------------------------------------------
+# Fuzzy helpers
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9 ]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _depluralise(word: str) -> str:
+    """Very light stemmer: strip trailing 's' / 'es' so 'bananas'→'banana'."""
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith("es") and len(word) > 3:
+        return word[:-2]
+    if word.endswith("s") and len(word) > 2:
+        return word[:-1]
+    return word
+
+
+def _query_tokens(query: str) -> set[str]:
+    stopwords = {"add", "remove", "get", "buy", "want", "give", "me", "a",
+                 "an", "the", "some", "of", "to", "please", "i", "my"}
+    tokens = _normalize(query).split()
+    stems = set()
+    for t in tokens:
+        if t not in stopwords:
+            stems.add(t)
+            stems.add(_depluralise(t))
+    return stems
+
+
+def _product_tokens(product: dict) -> set[str]:
+    blob = " ".join([
+        product.get("name", ""),
+        product.get("brand", ""),
+        product.get("category", ""),
+    ])
+    tokens = _normalize(blob).split()
+    stems = set()
+    for t in tokens:
+        stems.add(t)
+        stems.add(_depluralise(t))
+    return stems
+
+
+def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
+    """
+    Return True when at least one query token is:
+      - an exact match in the product tokens, OR
+      - a substring of any product token of length ≥ 3 (handles 'coca' in 'cocacola').
+    """
+    for qt in query_stems:
+        if qt in product_stems:
+            return True
+        if len(qt) >= 3:
+            for pt in product_stems:
+                if qt in pt or pt in qt:
+                    return True
+    return False
+
+
 def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None,
                      use_cart_fallback: bool = True) -> dict | None:
-    
-    # 1. Explicit query — require a minimum similarity score
+
+    # 1. Explicit query — fuzzy token overlap
     if query.strip():
         hits = rag.retrieve(query, top_k=3)
         kw_hits = inv.search_products(query)
@@ -122,27 +186,37 @@ def _resolve_product(query: str, session_id: str | None = None,
         for p in kw_hits:
             if p["product_id"] not in seen_ids:
                 hits.append(p)
-        
-        if hits:
-            # Validate: query must share at least one meaningful token with the hit
+
+        query_stems = _query_tokens(query)
+
+        if hits and query_stems:
             best = hits[0]
-            query_tokens = set(re.sub(r'[^a-z0-9 ]', '', query.lower()).split())
-            product_tokens = set(re.sub(r'[^a-z0-9 ]', '',
-                (best["name"] + " " + best.get("brand","") + " " + best.get("category","")).lower()).split()
-            )
-            stopwords = {"add","remove","get","buy","want","give","me","a","an","the","some","of","to"}
-            query_tokens -= stopwords
-            
-            if query_tokens & product_tokens:  # at least one token overlaps
+            product_stems = _product_tokens(best)
+            if _fuzzy_token_match(query_stems, product_stems):
                 return inv.get_product(best["product_id"])
-            else:
-                return None  # no real match — don't guess
-    
-    # 2. No explicit query — scan conversation history for a product name
-    # (only for remove/update contexts, NOT for add)
-    if not use_cart_fallback:
-        return None
-        
+
+        # RAG/keyword miss — fall back to a full-inventory fuzzy scan
+        if query_stems:
+            all_products = inv.get_all_products()
+            best_match = None
+            best_score = 0
+            for p in all_products:
+                p_stems = _product_tokens(p)
+                # count overlapping stems (after fuzzy expansion)
+                score = sum(
+                    1 for qt in query_stems
+                    if qt in p_stems or any(qt in pt or pt in qt for pt in p_stems if len(qt) >= 3)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_match = p
+            if best_match and best_score > 0:
+                return inv.get_product(best_match["product_id"])
+
+        return None  # genuinely not found
+
+    # 2. Empty query — scan conversation history for a product mention
+    #    (used for "add it back", "remove it", etc.)
     if history:
         all_products = inv.get_all_products()
         for turn in reversed(history[-6:]):
@@ -150,13 +224,13 @@ def _resolve_product(query: str, session_id: str | None = None,
             for p in all_products:
                 if p["name"].lower() in content:
                     return inv.get_product(p["product_id"])
-    
-    # 3. Cart fallback — only for remove/update, never for add
+
+    # 3. Cart fallback — only for remove/update contexts, never for add
     if use_cart_fallback and session_id:
         cart_items = crt.view_cart(session_id)
         if cart_items:
             return inv.get_product(cart_items[-1]["product_id"])
-    
+
     return None
 
 
@@ -219,12 +293,12 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
 
     elif action == "add_to_cart":
         qty = raw_qty if raw_qty and raw_qty > 0 else 1
-        # Never use cart fallback for add — if we can't match the query, say so
+        # Allow history scan for empty queries ("add it back"), but never cart fallback for add
         product = _resolve_product(query, session_id, history, use_cart_fallback=False)
         if not product:
             if not query.strip():
                 return "Which product do you want to add?"
-            return f"Sorry, I don't carry '{query}'. Try searching for what's available."
+            return f"Sorry, I couldn't find '{query}'. Try searching for what's available."
         result = crt.add_to_cart(session_id, product["product_id"], qty)
         if result["ok"]:
             fresh = inv.get_product(product["product_id"])
