@@ -216,6 +216,28 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
             return f"Added {qty}x {product['name']} to cart. ({remaining} units remaining in stock)"
         return f"Cannot add to cart: {result['reason']}"
 
+    elif action == "add_all":
+        products = inv.get_all_products()
+        if not products:
+            return "Inventory is empty, nothing to add."
+        added, skipped = [], []
+        for p in products:
+            fresh = inv.get_product(p["product_id"])
+            if not fresh or fresh["quantity"] == 0:
+                skipped.append(p["name"])
+                continue
+            result = crt.add_to_cart(session_id, fresh["product_id"], 1)
+            if result["ok"]:
+                added.append(fresh["name"])
+            else:
+                skipped.append(fresh["name"])
+        lines = []
+        if added:
+            lines.append(f"Added {len(added)} product(s) to cart: {', '.join(added)}.")
+        if skipped:
+            lines.append(f"Skipped (out of stock or error): {', '.join(skipped)}.")
+        return " ".join(lines) if lines else "Nothing could be added."
+
     elif action == "remove_from_cart":
         product = _resolve_product(query, session_id, history)
         if not product:
@@ -279,7 +301,7 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
 _DIRECT_INTENTS = {
     "add_to_cart", "remove_from_cart", "clear_cart",
     "view_cart", "place_order", "order_history", "unsupported",
-    "search", "list_all",
+    "search", "list_all", "add_all",
 }
 
 def chat(session_id: str, message: str, history: list[dict]) -> str:
