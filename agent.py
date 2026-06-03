@@ -110,30 +110,77 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
+def _normalize(text: str) -> list[str]:
+    """Lowercase, strip punctuation/hyphens, split into tokens."""
+    return re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
+
+
+def _fuzzy_match(s1: str, s2: str) -> int:
+    """Simple Levenshtein edit distance."""
+    a, b = s1.lower(), s2.lower()
+    if a == b:
+        return 0
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[:]
+        dp[0] = i
+        for j in range(1, n + 1):
+            dp[j] = prev[j - 1] if a[i-1] == b[j-1] else 1 + min(prev[j], dp[j-1], prev[j-1])
+    return dp[n]
+
+
 def _name_matches_query(product_name: str, query: str) -> bool:
-    """Check if any word in the query appears in the product name or vice versa."""
-    q_words = set(query.lower().split())
-    name_words = set(product_name.lower().split())
-    # Also check singular/plural by stripping trailing 's'
-    q_stems = {w.rstrip("s") for w in q_words}
-    name_stems = {w.rstrip("s") for w in name_words}
-    return bool(q_stems & name_stems)
+    """
+    Return True if the product name is a plausible match for the query.
+    Handles: punctuation, plurals, substrings, and minor typos (edit distance <= 2).
+    """
+    q_tokens = _normalize(query)
+    name_tokens = _normalize(product_name)
+
+    if not q_tokens:
+        return False
+
+    for qw in q_tokens:
+        if len(qw) < 3:  # skip very short words
+            continue
+        qw_stem = qw.rstrip("s")
+        for nw in name_tokens:
+            nw_stem = nw.rstrip("s")
+            # Exact or stem match
+            if qw_stem == nw_stem:
+                return True
+            # Substring: "coca" inside "cocacola" or vice-versa
+            if qw_stem in nw_stem or nw_stem in qw_stem:
+                return True
+            # Fuzzy: allow up to 2 edits for longer words
+            if len(qw) >= 5 and _fuzzy_match(qw, nw) <= 2:
+                return True
+            if len(qw) >= 4 and _fuzzy_match(qw_stem, nw_stem) <= 1:
+                return True
+
+    return False
 
 
 def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None) -> dict | None:
-    # 1. Explicit query — keyword search first (most precise), then RAG with name check
+    # 1. Explicit query — try keyword search first (exact/substring, most precise)
     if query.strip():
-        # Keyword search is exact/substring — trust it fully
         kw_hits = inv.search_products(query)
         if kw_hits:
             return inv.get_product(kw_hits[0]["product_id"])
 
-        # RAG is fuzzy — only trust if the returned product name actually relates to query
+        # RAG — only trust if the returned product name actually relates to query
         rag_hits = rag.retrieve(query, top_k=5)
         for hit in rag_hits:
             if _name_matches_query(hit["name"], query):
                 return inv.get_product(hit["product_id"])
+
+        # Full inventory scan with fuzzy name matching (catches typos like "coac cola")
+        all_products = inv.get_all_products()
+        for p in all_products:
+            if _name_matches_query(p["name"], query):
+                return inv.get_product(p["product_id"])
 
         # Explicit query was given but nothing matched — do NOT fall back to cart/history
         return None
