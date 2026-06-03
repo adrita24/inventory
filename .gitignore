@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+inventory.db
+inventory.db-shm
+inventory.db-wal
