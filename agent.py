@@ -67,6 +67,10 @@ Examples:
 "i have 1000 rupees" -> {"intent": "unsupported", "query": "i have 1000 rupees", "quantity": null}
 "vegetables available" -> {"intent": "search", "query": "vegetables", "quantity": null}
 "do you have coke" -> {"intent": "search", "query": "coke", "quantity": null}
+"what products do you have" -> {"intent": "list_all", "query": "", "quantity": null}
+"what do you sell" -> {"intent": "list_all", "query": "", "quantity": null}
+"show me all products" -> {"intent": "list_all", "query": "", "quantity": null}
+"what is available" -> {"intent": "list_all", "query": "", "quantity": null}
 "how do 74 still remain" -> {"intent": "chitchat", "query": "how do 74 still remain", "quantity": null}
 "why is the count still the same" -> {"intent": "chitchat", "query": "why is the count still the same", "quantity": null}
 "no add back" -> {"intent": "add_to_cart", "query": "", "quantity": 1}
@@ -261,6 +265,13 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
         return "\n".join(lines)
 
     elif action == "search":
+        # Redirect generic "show all / list products / what do you have" queries
+        _LIST_ALL_KEYWORDS = {"all", "everything", "products", "items", "inventory",
+                              "available", "list", "show", "catalogue", "catalog"}
+        if query and not (set(_normalize(query).split()) - _LIST_ALL_KEYWORDS):
+            # query is entirely list-all keywords — treat as list_all
+            return _dispatch({"intent": "list_all"}, session_id, history)
+
         if not query:
             cart_items = crt.view_cart(session_id)
             if cart_items:
