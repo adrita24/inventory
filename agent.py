@@ -111,8 +111,10 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
 def _resolve_product(query: str, session_id: str | None = None,
-                     history: list[dict] | None = None) -> dict | None:
-    # 1. Explicit query — use RAG + keyword search, refresh from live DB
+                     history: list[dict] | None = None,
+                     use_cart_fallback: bool = True) -> dict | None:
+    
+    # 1. Explicit query — require a minimum similarity score
     if query.strip():
         hits = rag.retrieve(query, top_k=3)
         kw_hits = inv.search_products(query)
@@ -120,11 +122,27 @@ def _resolve_product(query: str, session_id: str | None = None,
         for p in kw_hits:
             if p["product_id"] not in seen_ids:
                 hits.append(p)
+        
         if hits:
-            # Always refresh from live DB — RAG catalog may have stale quantities
-            return inv.get_product(hits[0]["product_id"])
-
-    # 2. No explicit query — scan recent conversation for a product name
+            # Validate: query must share at least one meaningful token with the hit
+            best = hits[0]
+            query_tokens = set(re.sub(r'[^a-z0-9 ]', '', query.lower()).split())
+            product_tokens = set(re.sub(r'[^a-z0-9 ]', '',
+                (best["name"] + " " + best.get("brand","") + " " + best.get("category","")).lower()).split()
+            )
+            stopwords = {"add","remove","get","buy","want","give","me","a","an","the","some","of","to"}
+            query_tokens -= stopwords
+            
+            if query_tokens & product_tokens:  # at least one token overlaps
+                return inv.get_product(best["product_id"])
+            else:
+                return None  # no real match — don't guess
+    
+    # 2. No explicit query — scan conversation history for a product name
+    # (only for remove/update contexts, NOT for add)
+    if not use_cart_fallback:
+        return None
+        
     if history:
         all_products = inv.get_all_products()
         for turn in reversed(history[-6:]):
@@ -132,13 +150,13 @@ def _resolve_product(query: str, session_id: str | None = None,
             for p in all_products:
                 if p["name"].lower() in content:
                     return inv.get_product(p["product_id"])
-
-    # 3. Last resort — most recent item in cart
-    if session_id:
+    
+    # 3. Cart fallback — only for remove/update, never for add
+    if use_cart_fallback and session_id:
         cart_items = crt.view_cart(session_id)
         if cart_items:
             return inv.get_product(cart_items[-1]["product_id"])
-
+    
     return None
 
 
@@ -201,11 +219,12 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
 
     elif action == "add_to_cart":
         qty = raw_qty if raw_qty and raw_qty > 0 else 1
-        product = _resolve_product(query, session_id, history)
+        # Never use cart fallback for add — if we can't match the query, say so
+        product = _resolve_product(query, session_id, history, use_cart_fallback=False)
         if not product:
             if not query.strip():
                 return "Which product do you want to add?"
-            return f"No product matching '{query}' found in inventory."
+            return f"Sorry, I don't carry '{query}'. Try searching for what's available."
         result = crt.add_to_cart(session_id, product["product_id"], qty)
         if result["ok"]:
             fresh = inv.get_product(product["product_id"])
