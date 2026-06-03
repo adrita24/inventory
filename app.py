@@ -35,10 +35,6 @@ with st.sidebar:
     st.title("Inventory tracker")
     st.caption(f"Session: `{SESSION[:8]}...`")
 
-    api_key = st.text_input("Groq API Key", type="password", value=os.environ.get("GROQ_API_KEY", ""))
-    if api_key:
-        os.environ["GROQ_API_KEY"] = api_key
-
     st.divider()
     st.subheader("Cart")
     cart_items = view_cart(SESSION)
@@ -48,7 +44,7 @@ with st.sidebar:
             st.write(f"**{item['name']}** x{item['quantity']} — ₹{item['subtotal']:.2f}")
             running_total += item["subtotal"]
         st.write(f"**Total: ₹{running_total:.2f}**")
-        if st.button("🗑 Clear Cart"):
+        if st.button("Clear Cart"):
             clear_cart(SESSION)
             st.rerun()
     else:
@@ -72,11 +68,11 @@ with st.sidebar:
         ensure_session(st.session_state.session_id)
         st.rerun()
 
-st.title("🛒 Inventory tracker Shopping Assistant")
+st.title("Inventory tracker Shopping Assistant")
 st.caption("Adrita Guha")
 
 if not os.environ.get("GROQ_API_KEY"):
-    st.warning("Enter your Groq API Key in the sidebar to start chatting.")
+    st.error("GROQ_API_KEY not set. Add it in Streamlit Cloud secrets or a local .env file.")
     st.stop()
 
 for msg in st.session_state.messages:
@@ -106,7 +102,6 @@ if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
-
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
@@ -114,6 +109,5 @@ if user_input:
             except Exception as e:
                 response = f"Error: {e}"
         st.markdown(response)
-
     st.session_state.messages.append({"role": "assistant", "content": response})
     st.rerun()
