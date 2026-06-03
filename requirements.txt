@@ -5,3 +5,4 @@ langchain-groq>=0.1.0
 scikit-learn>=1.4.0
 numpy>=1.26.0
 pytest
+python-dotenv
