@@ -110,19 +110,33 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
+def _name_matches_query(product_name: str, query: str) -> bool:
+    """Check if any word in the query appears in the product name or vice versa."""
+    q_words = set(query.lower().split())
+    name_words = set(product_name.lower().split())
+    # Also check singular/plural by stripping trailing 's'
+    q_stems = {w.rstrip("s") for w in q_words}
+    name_stems = {w.rstrip("s") for w in name_words}
+    return bool(q_stems & name_stems)
+
+
 def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None) -> dict | None:
-    # 1. Explicit query — use RAG + keyword search, refresh from live DB
+    # 1. Explicit query — keyword search first (most precise), then RAG with name check
     if query.strip():
-        hits = rag.retrieve(query, top_k=3)
+        # Keyword search is exact/substring — trust it fully
         kw_hits = inv.search_products(query)
-        seen_ids = {p["product_id"] for p in hits}
-        for p in kw_hits:
-            if p["product_id"] not in seen_ids:
-                hits.append(p)
-        if hits:
-            # Always refresh from live DB — RAG catalog may have stale quantities
-            return inv.get_product(hits[0]["product_id"])
+        if kw_hits:
+            return inv.get_product(kw_hits[0]["product_id"])
+
+        # RAG is fuzzy — only trust if the returned product name actually relates to query
+        rag_hits = rag.retrieve(query, top_k=5)
+        for hit in rag_hits:
+            if _name_matches_query(hit["name"], query):
+                return inv.get_product(hit["product_id"])
+
+        # Explicit query was given but nothing matched — do NOT fall back to cart/history
+        return None
 
     # 2. No explicit query — scan recent conversation for a product name
     if history:
