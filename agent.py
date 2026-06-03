@@ -162,14 +162,16 @@ def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
     """
     Return True when at least one query token is:
       - an exact match in the product tokens, OR
-      - a substring of any product token of length ≥ 3 (handles 'coca' in 'cocacola').
+      - a prefix of a product token of length ≥ 4 (handles 'coca' in 'cocacola',
+        'water' in 'watermelon'), but NOT short tokens like 'g' matching 'mango'.
+    Both directions: query prefix of product, OR product prefix of query.
     """
     for qt in query_stems:
         if qt in product_stems:
             return True
-        if len(qt) >= 3:
+        if len(qt) >= 4:
             for pt in product_stems:
-                if qt in pt or pt in qt:
+                if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
                     return True
     return False
 
@@ -202,14 +204,19 @@ def _resolve_product(query: str, session_id: str | None = None,
             best_score = 0
             for p in all_products:
                 p_stems = _product_tokens(p)
-                # count overlapping stems (after fuzzy expansion)
-                score = sum(
-                    1 for qt in query_stems
-                    if qt in p_stems or any(qt in pt or pt in qt for pt in p_stems if len(qt) >= 3)
-                )
+                score = 0
+                for qt in query_stems:
+                    if qt in p_stems:
+                        score += 2  # exact match scores higher
+                    elif len(qt) >= 4:
+                        for pt in p_stems:
+                            if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
+                                score += 1
+                                break
                 if score > best_score:
                     best_score = score
                     best_match = p
+            # Require at least one real match (score > 0) to avoid false positives
             if best_match and best_score > 0:
                 return inv.get_product(best_match["product_id"])
 
@@ -271,6 +278,9 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
                 if p["product_id"] not in seen_ids:
                     products.append(p)
             products = products[:5]
+            # If nothing matched, say so clearly rather than asking "What are you looking for?"
+            if not products:
+                return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
 
         # Refresh every product from live DB — RAG catalog quantity is stale after orders
         fresh_products = []
@@ -288,6 +298,8 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
             p["quantity"] = p["quantity"] - cart_map.get(p["product_id"], 0)
             adjusted.append(p)
         if not adjusted:
+            if query:
+                return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
             return "What are you looking for?"
         return rag.format_context(adjusted)
 
