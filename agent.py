@@ -24,12 +24,11 @@ INTENT_PROMPT = """You are an intent classifier for a grocery chatbot. Extract t
 Possible intents:
   search        - user wants to find/check a product or category. Extract "query" string.
   list_all      - user wants to see all available products.
-  add_to_cart   - user wants to add a specific product. Extract "query" string and "quantity" integer.
-  add_all       - user wants to add ALL products (or the whole inventory/everything) to cart. No query needed.
+  add_to_cart   - user wants to add a product. Extract "query" string and "quantity" integer.
   remove_from_cart - user wants to remove a product. Extract "query" (product name, empty string if not mentioned) and "quantity" (integer or null -- null means remove all).
   clear_cart    - user wants to empty the cart entirely.
   view_cart     - user wants to see cart contents.
-  place_order   - user wants to checkout / buy everything currently in cart.
+  place_order   - user wants to checkout / buy everything in cart.
   order_history - user wants to see past orders.
   unsupported   - user wants something the system cannot do, e.g. "buy all except X", partial checkout, apply coupon.
   chitchat      - anything else (greetings, random questions unrelated to shopping).
@@ -41,9 +40,6 @@ Rules:
 - "vegetables available" or "show dairy" -> intent: search, query: "vegetables" or "dairy".
 - If the user says "yes" in reply to a suggestion, infer intent from conversation context.
 - "add back", "no add back", "put it back", "add it again" -> intent: add_to_cart, query: "" (system resolves from context).
-- "add everything", "add all products", "add the whole inventory", "add everything to cart" -> intent: add_all.
-- "buy the whole inventory", "order everything", "buy everything" -> intent: add_all (user wants to add all then can place order separately; do NOT map to place_order).
-- IMPORTANT: "buy all" with nothing else = place_order (cart already has items). "buy everything/whole inventory" = add_all (stocking the cart from scratch).
 
 Return exactly this shape (no other text):
 {"intent": "<intent>", "query": "<string>", "quantity": <integer or null>}
@@ -56,21 +52,11 @@ Examples:
 "remove them" -> {"intent": "remove_from_cart", "query": "", "quantity": null}
 "what's in my cart" -> {"intent": "view_cart", "query": "", "quantity": null}
 "buy all" -> {"intent": "place_order", "query": "", "quantity": null}
-"add everything to the cart" -> {"intent": "add_all", "query": "", "quantity": null}
-"add all products" -> {"intent": "add_all", "query": "", "quantity": null}
-"buy the whole inventory" -> {"intent": "add_all", "query": "", "quantity": null}
-"order everything" -> {"intent": "add_all", "query": "", "quantity": null}
-"buy everything" -> {"intent": "add_all", "query": "", "quantity": null}
-"add the whole inventory to my cart" -> {"intent": "add_all", "query": "", "quantity": null}
 "buy all except onions" -> {"intent": "unsupported", "query": "buy all except onions", "quantity": null}
 "my budget is 500" -> {"intent": "unsupported", "query": "my budget is 500", "quantity": null}
 "i have 1000 rupees" -> {"intent": "unsupported", "query": "i have 1000 rupees", "quantity": null}
 "vegetables available" -> {"intent": "search", "query": "vegetables", "quantity": null}
 "do you have coke" -> {"intent": "search", "query": "coke", "quantity": null}
-"what products do you have" -> {"intent": "list_all", "query": "", "quantity": null}
-"what do you sell" -> {"intent": "list_all", "query": "", "quantity": null}
-"show me all products" -> {"intent": "list_all", "query": "", "quantity": null}
-"what is available" -> {"intent": "list_all", "query": "", "quantity": null}
 "how do 74 still remain" -> {"intent": "chitchat", "query": "how do 74 still remain", "quantity": null}
 "why is the count still the same" -> {"intent": "chitchat", "query": "why is the count still the same", "quantity": null}
 "no add back" -> {"intent": "add_to_cart", "query": "", "quantity": 1}
@@ -114,90 +100,9 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
-# ---------------------------------------------------------------------------
-# Fuzzy helpers
-# ---------------------------------------------------------------------------
-
-def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation, collapse spaces."""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9 ]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _depluralise(word: str) -> str:
-    """Very light stemmer: strip trailing 's' / 'es' so 'bananas'→'banana'."""
-    if word.endswith("ies") and len(word) > 4:
-        return word[:-3] + "y"
-    if word.endswith("es") and len(word) > 3:
-        return word[:-2]
-    if word.endswith("s") and len(word) > 2:
-        return word[:-1]
-    return word
-
-
-def _query_tokens(query: str) -> set[str]:
-    stopwords = {"add", "remove", "get", "buy", "want", "give", "me", "a",
-                 "an", "the", "some", "of", "to", "please", "i", "my"}
-    tokens = _normalize(query).split()
-    stems = set()
-    for t in tokens:
-        if t not in stopwords:
-            stems.add(t)
-            stems.add(_depluralise(t))
-    return stems
-
-
-def _product_tokens(product: dict) -> set[str]:
-    blob = " ".join([
-        product.get("name", ""),
-        product.get("brand", ""),
-        product.get("category", ""),
-    ])
-    tokens = _normalize(blob).split()
-    stems = set()
-    for t in tokens:
-        stems.add(t)
-        stems.add(_depluralise(t))
-    return stems
-
-
-def _fuzzy_token_match(query_stems: set[str], product_stems: set[str],
-                       product: dict | None = None) -> bool:
-    """
-    Return True when at least one query token is:
-      - an exact match in the product tokens, OR
-      - a prefix of a product token of length >= 4, OR
-      - contained within the concatenated product name (handles run-together
-        queries like 'surfexcel', 'cocacola', 'redbull').
-    """
-    for qt in query_stems:
-        if qt in product_stems:
-            return True
-        if len(qt) >= 4:
-            for pt in product_stems:
-                if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
-                    return True
-
-    # Run-together match: check if query token appears in squished product name
-    if product is not None:
-        squished = _normalize(
-            product.get("name", "") + " " +
-            product.get("brand", "") + " " +
-            product.get("category", "")
-        ).replace(" ", "")
-        for qt in query_stems:
-            if len(qt) >= 4 and qt in squished:
-                return True
-
-    return False
-
-
 def _resolve_product(query: str, session_id: str | None = None,
-                     history: list[dict] | None = None,
-                     use_cart_fallback: bool = True) -> dict | None:
-
-    # 1. Explicit query — fuzzy token overlap
+                     history: list[dict] | None = None) -> dict | None:
+    # 1. Explicit query — use RAG + keyword search, refresh from live DB
     if query.strip():
         hits = rag.retrieve(query, top_k=3)
         kw_hits = inv.search_products(query)
@@ -205,49 +110,11 @@ def _resolve_product(query: str, session_id: str | None = None,
         for p in kw_hits:
             if p["product_id"] not in seen_ids:
                 hits.append(p)
+        if hits:
+            # Always refresh from live DB — RAG catalog may have stale quantities
+            return inv.get_product(hits[0]["product_id"])
 
-        query_stems = _query_tokens(query)
-
-        if hits and query_stems:
-            best = hits[0]
-            product_stems = _product_tokens(best)
-            if _fuzzy_token_match(query_stems, product_stems, best):
-                return inv.get_product(best["product_id"])
-
-        # RAG/keyword miss — fall back to a full-inventory fuzzy scan
-        if query_stems:
-            all_products = inv.get_all_products()
-            best_match = None
-            best_score = 0
-            for p in all_products:
-                p_stems = _product_tokens(p)
-                squished = _normalize(
-                    p.get("name", "") + " " + p.get("brand", "") + " " + p.get("category", "")
-                ).replace(" ", "")
-                score = 0
-                for qt in query_stems:
-                    if qt in p_stems:
-                        score += 2  # exact match scores higher
-                    elif len(qt) >= 4:
-                        for pt in p_stems:
-                            if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
-                                score += 1
-                                break
-                        else:
-                            # run-together: query token found in squished product name
-                            if qt in squished:
-                                score += 1
-                if score > best_score:
-                    best_score = score
-                    best_match = p
-            # Require at least one real match (score > 0) to avoid false positives
-            if best_match and best_score > 0:
-                return inv.get_product(best_match["product_id"])
-
-        return None  # genuinely not found
-
-    # 2. Empty query — scan conversation history for a product mention
-    #    (used for "add it back", "remove it", etc.)
+    # 2. No explicit query — scan recent conversation for a product name
     if history:
         all_products = inv.get_all_products()
         for turn in reversed(history[-6:]):
@@ -256,8 +123,8 @@ def _resolve_product(query: str, session_id: str | None = None,
                 if p["name"].lower() in content:
                     return inv.get_product(p["product_id"])
 
-    # 3. Cart fallback — only for remove/update contexts, never for add
-    if use_cart_fallback and session_id:
+    # 3. Last resort — most recent item in cart
+    if session_id:
         cart_items = crt.view_cart(session_id)
         if cart_items:
             return inv.get_product(cart_items[-1]["product_id"])
@@ -285,13 +152,6 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
         return "\n".join(lines)
 
     elif action == "search":
-        # Redirect generic "show all / list products / what do you have" queries
-        _LIST_ALL_KEYWORDS = {"all", "everything", "products", "items", "inventory",
-                              "available", "list", "show", "catalogue", "catalog"}
-        if query and not (set(_normalize(query).split()) - _LIST_ALL_KEYWORDS):
-            # query is entirely list-all keywords — treat as list_all
-            return _dispatch({"intent": "list_all"}, session_id, history)
-
         if not query:
             cart_items = crt.view_cart(session_id)
             if cart_items:
@@ -309,9 +169,6 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
                 if p["product_id"] not in seen_ids:
                     products.append(p)
             products = products[:5]
-            # If nothing matched, say so clearly rather than asking "What are you looking for?"
-            if not products:
-                return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
 
         # Refresh every product from live DB — RAG catalog quantity is stale after orders
         fresh_products = []
@@ -329,19 +186,16 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
             p["quantity"] = p["quantity"] - cart_map.get(p["product_id"], 0)
             adjusted.append(p)
         if not adjusted:
-            if query:
-                return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
             return "What are you looking for?"
         return rag.format_context(adjusted)
 
     elif action == "add_to_cart":
         qty = raw_qty if raw_qty and raw_qty > 0 else 1
-        # Allow history scan for empty queries ("add it back"), but never cart fallback for add
-        product = _resolve_product(query, session_id, history, use_cart_fallback=False)
+        product = _resolve_product(query, session_id, history)
         if not product:
             if not query.strip():
                 return "Which product do you want to add?"
-            return f"Sorry, I couldn't find '{query}'. Try searching for what's available."
+            return f"No product matching '{query}' found in inventory."
         result = crt.add_to_cart(session_id, product["product_id"], qty)
         if result["ok"]:
             fresh = inv.get_product(product["product_id"])
@@ -351,28 +205,6 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
             remaining = db_stock - in_cart
             return f"Added {qty}x {product['name']} to cart. ({remaining} units remaining in stock)"
         return f"Cannot add to cart: {result['reason']}"
-
-    elif action == "add_all":
-        products = inv.get_all_products()
-        if not products:
-            return "Inventory is empty, nothing to add."
-        added, skipped = [], []
-        for p in products:
-            fresh = inv.get_product(p["product_id"])
-            if not fresh or fresh["quantity"] == 0:
-                skipped.append(p["name"])
-                continue
-            result = crt.add_to_cart(session_id, fresh["product_id"], 1)
-            if result["ok"]:
-                added.append(fresh["name"])
-            else:
-                skipped.append(fresh["name"])
-        lines = []
-        if added:
-            lines.append(f"Added {len(added)} product(s) to cart: {', '.join(added)}.")
-        if skipped:
-            lines.append(f"Skipped (out of stock or error): {', '.join(skipped)}.")
-        return " ".join(lines) if lines else "Nothing could be added."
 
     elif action == "remove_from_cart":
         product = _resolve_product(query, session_id, history)
@@ -437,7 +269,7 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
 _DIRECT_INTENTS = {
     "add_to_cart", "remove_from_cart", "clear_cart",
     "view_cart", "place_order", "order_history", "unsupported",
-    "search", "list_all", "add_all",
+    "search", "list_all",
 }
 
 def chat(session_id: str, message: str, history: list[dict]) -> str:
