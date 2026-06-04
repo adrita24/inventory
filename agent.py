@@ -162,13 +162,14 @@ def _product_tokens(product: dict) -> set[str]:
     return stems
 
 
-def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
+def _fuzzy_token_match(query_stems: set[str], product_stems: set[str],
+                       product: dict | None = None) -> bool:
     """
     Return True when at least one query token is:
       - an exact match in the product tokens, OR
-      - a prefix of a product token of length ≥ 4 (handles 'coca' in 'cocacola',
-        'water' in 'watermelon'), but NOT short tokens like 'g' matching 'mango'.
-    Both directions: query prefix of product, OR product prefix of query.
+      - a prefix of a product token of length >= 4, OR
+      - contained within the concatenated product name (handles run-together
+        queries like 'surfexcel', 'cocacola', 'redbull').
     """
     for qt in query_stems:
         if qt in product_stems:
@@ -177,6 +178,18 @@ def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
             for pt in product_stems:
                 if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
                     return True
+
+    # Run-together match: check if query token appears in squished product name
+    if product is not None:
+        squished = _normalize(
+            product.get("name", "") + " " +
+            product.get("brand", "") + " " +
+            product.get("category", "")
+        ).replace(" ", "")
+        for qt in query_stems:
+            if len(qt) >= 4 and qt in squished:
+                return True
+
     return False
 
 
@@ -198,7 +211,7 @@ def _resolve_product(query: str, session_id: str | None = None,
         if hits and query_stems:
             best = hits[0]
             product_stems = _product_tokens(best)
-            if _fuzzy_token_match(query_stems, product_stems):
+            if _fuzzy_token_match(query_stems, product_stems, best):
                 return inv.get_product(best["product_id"])
 
         # RAG/keyword miss — fall back to a full-inventory fuzzy scan
@@ -208,6 +221,9 @@ def _resolve_product(query: str, session_id: str | None = None,
             best_score = 0
             for p in all_products:
                 p_stems = _product_tokens(p)
+                squished = _normalize(
+                    p.get("name", "") + " " + p.get("brand", "") + " " + p.get("category", "")
+                ).replace(" ", "")
                 score = 0
                 for qt in query_stems:
                     if qt in p_stems:
@@ -217,6 +233,10 @@ def _resolve_product(query: str, session_id: str | None = None,
                             if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
                                 score += 1
                                 break
+                        else:
+                            # run-together: query token found in squished product name
+                            if qt in squished:
+                                score += 1
                 if score > best_score:
                     best_score = score
                     best_match = p
