@@ -162,14 +162,13 @@ def _product_tokens(product: dict) -> set[str]:
     return stems
 
 
-def _fuzzy_token_match(query_stems: set[str], product_stems: set[str],
-                       product: dict | None = None) -> bool:
+def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
     """
     Return True when at least one query token is:
       - an exact match in the product tokens, OR
-      - a prefix of a product token of length >= 4, OR
-      - contained within the concatenated product name (handles run-together
-        queries like 'surfexcel', 'cocacola', 'redbull').
+      - a prefix of a product token of length ≥ 4 (handles 'coca' in 'cocacola',
+        'water' in 'watermelon'), but NOT short tokens like 'g' matching 'mango'.
+    Both directions: query prefix of product, OR product prefix of query.
     """
     for qt in query_stems:
         if qt in product_stems:
@@ -178,18 +177,6 @@ def _fuzzy_token_match(query_stems: set[str], product_stems: set[str],
             for pt in product_stems:
                 if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
                     return True
-
-    # Run-together match: check if query token appears in squished product name
-    if product is not None:
-        squished = _normalize(
-            product.get("name", "") + " " +
-            product.get("brand", "") + " " +
-            product.get("category", "")
-        ).replace(" ", "")
-        for qt in query_stems:
-            if len(qt) >= 4 and qt in squished:
-                return True
-
     return False
 
 
@@ -197,57 +184,45 @@ def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None,
                      use_cart_fallback: bool = True) -> dict | None:
 
-    # 1. Explicit query — score every product, use RAG/keyword to boost candidates
+    # 1. Explicit query — fuzzy token overlap
     if query.strip():
-        query_stems = _query_tokens(query)
-        if not query_stems:
-            return None
-
-        # Gather RAG + keyword hits as priority candidates
-        hits = rag.retrieve(query, top_k=5)
+        hits = rag.retrieve(query, top_k=3)
         kw_hits = inv.search_products(query)
         seen_ids = {p["product_id"] for p in hits}
         for p in kw_hits:
             if p["product_id"] not in seen_ids:
                 hits.append(p)
 
-        def _score(p: dict) -> int:
-            p_stems = _product_tokens(p)
-            squished = _normalize(
-                p.get("name", "") + " " + p.get("brand", "") + " " + p.get("category", "")
-            ).replace(" ", "")
-            score = 0
-            for qt in query_stems:
-                if qt in p_stems:
-                    score += 4  # exact token match
-                elif len(qt) >= 4:
-                    if any(len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt))
-                           for pt in p_stems):
-                        score += 2  # prefix match
-                    elif qt in squished:
-                        score += 2  # run-together match (e.g. surfexcel, redbull)
-            return score
+        query_stems = _query_tokens(query)
 
-        best_match = None
-        best_score = 0
+        if hits and query_stems:
+            best = hits[0]
+            product_stems = _product_tokens(best)
+            if _fuzzy_token_match(query_stems, product_stems):
+                return inv.get_product(best["product_id"])
 
-        # Score RAG/keyword hits first (fast path)
-        for p in hits:
-            s = _score(p)
-            if s > best_score:
-                best_score = s
-                best_match = p
-
-        # If no confident hit from RAG, scan full inventory
-        if best_score == 0:
-            for p in inv.get_all_products():
-                s = _score(p)
-                if s > best_score:
-                    best_score = s
+        # RAG/keyword miss — fall back to a full-inventory fuzzy scan
+        if query_stems:
+            all_products = inv.get_all_products()
+            best_match = None
+            best_score = 0
+            for p in all_products:
+                p_stems = _product_tokens(p)
+                score = 0
+                for qt in query_stems:
+                    if qt in p_stems:
+                        score += 2  # exact match scores higher
+                    elif len(qt) >= 4:
+                        for pt in p_stems:
+                            if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
+                                score += 1
+                                break
+                if score > best_score:
+                    best_score = score
                     best_match = p
-
-        if best_match and best_score > 0:
-            return inv.get_product(best_match["product_id"])
+            # Require at least one real match (score > 0) to avoid false positives
+            if best_match and best_score > 0:
+                return inv.get_product(best_match["product_id"])
 
         return None  # genuinely not found
 
