@@ -114,6 +114,12 @@ def _extract_intent(message: str, history: list[dict]) -> dict:
 
 CATEGORIES = {"vegetables", "fruits", "dairy", "snacks", "beverages", "detergents", "household", "personal care"}
 
+def _split_multi_query(query: str) -> list[str]:
+    """Split 'butter and milk' or 'butter, milk, eggs' into ['butter', 'milk', 'eggs']."""
+    # Split on ' and ', ' & ', or commas
+    parts = re.split(r'\s+and\s+|\s*[,&]\s*', query, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p.strip()]
+
 # ---------------------------------------------------------------------------
 # Fuzzy helpers
 # ---------------------------------------------------------------------------
@@ -162,13 +168,14 @@ def _product_tokens(product: dict) -> set[str]:
     return stems
 
 
-def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
+def _fuzzy_token_match(query_stems: set[str], product_stems: set[str],
+                       product: dict | None = None) -> bool:
     """
     Return True when at least one query token is:
       - an exact match in the product tokens, OR
-      - a prefix of a product token of length ≥ 4 (handles 'coca' in 'cocacola',
-        'water' in 'watermelon'), but NOT short tokens like 'g' matching 'mango'.
-    Both directions: query prefix of product, OR product prefix of query.
+      - a prefix of a product token of length >= 4, OR
+      - contained within the concatenated product name (handles run-together
+        queries like 'surfexcel', 'cocacola', 'redbull').
     """
     for qt in query_stems:
         if qt in product_stems:
@@ -177,6 +184,18 @@ def _fuzzy_token_match(query_stems: set[str], product_stems: set[str]) -> bool:
             for pt in product_stems:
                 if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
                     return True
+
+    # Run-together match: check if query token appears in squished product name
+    if product is not None:
+        squished = _normalize(
+            product.get("name", "") + " " +
+            product.get("brand", "") + " " +
+            product.get("category", "")
+        ).replace(" ", "")
+        for qt in query_stems:
+            if len(qt) >= 4 and qt in squished:
+                return True
+
     return False
 
 
@@ -184,45 +203,57 @@ def _resolve_product(query: str, session_id: str | None = None,
                      history: list[dict] | None = None,
                      use_cart_fallback: bool = True) -> dict | None:
 
-    # 1. Explicit query — fuzzy token overlap
+    # 1. Explicit query — score every product, use RAG/keyword to boost candidates
     if query.strip():
-        hits = rag.retrieve(query, top_k=3)
+        query_stems = _query_tokens(query)
+        if not query_stems:
+            return None
+
+        # Gather RAG + keyword hits as priority candidates
+        hits = rag.retrieve(query, top_k=5)
         kw_hits = inv.search_products(query)
         seen_ids = {p["product_id"] for p in hits}
         for p in kw_hits:
             if p["product_id"] not in seen_ids:
                 hits.append(p)
 
-        query_stems = _query_tokens(query)
+        def _score(p: dict) -> int:
+            p_stems = _product_tokens(p)
+            squished = _normalize(
+                p.get("name", "") + " " + p.get("brand", "") + " " + p.get("category", "")
+            ).replace(" ", "")
+            score = 0
+            for qt in query_stems:
+                if qt in p_stems:
+                    score += 4  # exact token match
+                elif len(qt) >= 4:
+                    if any(len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt))
+                           for pt in p_stems):
+                        score += 2  # prefix match
+                    elif qt in squished:
+                        score += 2  # run-together match (e.g. surfexcel, redbull)
+            return score
 
-        if hits and query_stems:
-            best = hits[0]
-            product_stems = _product_tokens(best)
-            if _fuzzy_token_match(query_stems, product_stems):
-                return inv.get_product(best["product_id"])
+        best_match = None
+        best_score = 0
 
-        # RAG/keyword miss — fall back to a full-inventory fuzzy scan
-        if query_stems:
-            all_products = inv.get_all_products()
-            best_match = None
-            best_score = 0
-            for p in all_products:
-                p_stems = _product_tokens(p)
-                score = 0
-                for qt in query_stems:
-                    if qt in p_stems:
-                        score += 2  # exact match scores higher
-                    elif len(qt) >= 4:
-                        for pt in p_stems:
-                            if len(pt) >= 4 and (pt.startswith(qt) or qt.startswith(pt)):
-                                score += 1
-                                break
-                if score > best_score:
-                    best_score = score
+        # Score RAG/keyword hits first (fast path)
+        for p in hits:
+            s = _score(p)
+            if s > best_score:
+                best_score = s
+                best_match = p
+
+        # If no confident hit from RAG, scan full inventory
+        if best_score == 0:
+            for p in inv.get_all_products():
+                s = _score(p)
+                if s > best_score:
+                    best_score = s
                     best_match = p
-            # Require at least one real match (score > 0) to avoid false positives
-            if best_match and best_score > 0:
-                return inv.get_product(best_match["product_id"])
+
+        if best_match and best_score > 0:
+            return inv.get_product(best_match["product_id"])
 
         return None  # genuinely not found
 
@@ -289,9 +320,13 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
                 if p["product_id"] not in seen_ids:
                     products.append(p)
             products = products[:5]
-            # If nothing matched, say so clearly rather than asking "What are you looking for?"
+            # If nothing matched, try fuzzy resolve (handles surfexcel, redbull, etc.)
             if not products:
-                return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
+                found = _resolve_product(query, session_id, history, use_cart_fallback=False)
+                if found:
+                    products = [found]
+                else:
+                    return f"Sorry, we don't carry '{query}'. Type 'show all' to see what's available."
 
         # Refresh every product from live DB — RAG catalog quantity is stale after orders
         fresh_products = []
@@ -316,21 +351,45 @@ def _dispatch(intent: dict, session_id: str, history: list[dict] | None = None) 
 
     elif action == "add_to_cart":
         qty = raw_qty if raw_qty and raw_qty > 0 else 1
-        # Allow history scan for empty queries ("add it back"), but never cart fallback for add
-        product = _resolve_product(query, session_id, history, use_cart_fallback=False)
-        if not product:
-            if not query.strip():
+
+        # No query — try to resolve from history context ("add it back")
+        if not query.strip():
+            product = _resolve_product("", session_id, history, use_cart_fallback=False)
+            if not product:
                 return "Which product do you want to add?"
-            return f"Sorry, I couldn't find '{query}'. Try searching for what's available."
-        result = crt.add_to_cart(session_id, product["product_id"], qty)
-        if result["ok"]:
-            fresh = inv.get_product(product["product_id"])
-            db_stock = fresh["quantity"] if fresh else 0
-            cart_items = crt.view_cart(session_id)
-            in_cart = next((i["quantity"] for i in cart_items if i["product_id"]==product["product_id"]), 0)
-            remaining = db_stock - in_cart
-            return f"Added {qty}x {product['name']} to cart. ({remaining} units remaining in stock)"
-        return f"Cannot add to cart: {result['reason']}"
+            result = crt.add_to_cart(session_id, product["product_id"], qty)
+            if result["ok"]:
+                fresh = inv.get_product(product["product_id"])
+                db_stock = fresh["quantity"] if fresh else 0
+                cart_items = crt.view_cart(session_id)
+                in_cart = next((i["quantity"] for i in cart_items if i["product_id"]==product["product_id"]), 0)
+                return f"Added {qty}x {product['name']} to cart. ({db_stock - in_cart} units remaining in stock)"
+            return f"Cannot add to cart: {result['reason']}"
+
+        # Split multi-product queries: "butter and milk", "coke, redbull"
+        sub_queries = _split_multi_query(query)
+        added_lines, failed = [], []
+        for sq in sub_queries:
+            product = _resolve_product(sq, session_id, history, use_cart_fallback=False)
+            if not product:
+                failed.append(sq)
+                continue
+            result = crt.add_to_cart(session_id, product["product_id"], qty)
+            if result["ok"]:
+                fresh = inv.get_product(product["product_id"])
+                db_stock = fresh["quantity"] if fresh else 0
+                cart_items = crt.view_cart(session_id)
+                in_cart = next((i["quantity"] for i in cart_items if i["product_id"]==product["product_id"]), 0)
+                added_lines.append(f"{product['name']} x{qty} ({db_stock - in_cart} left in stock)")
+            else:
+                failed.append(f"{product['name']} ({result['reason']})")
+
+        lines = []
+        if added_lines:
+            lines.append("Added to cart: " + ", ".join(added_lines) + ".")
+        if failed:
+            lines.append("Could not add: " + ", ".join(failed) + ".")
+        return " ".join(lines) if lines else "Nothing could be added."
 
     elif action == "add_all":
         products = inv.get_all_products()
