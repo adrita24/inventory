@@ -5,21 +5,25 @@ from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "inventory.db")
 
-_lock = threading.Lock()
-_conn: sqlite3.Connection | None = None
+_thread_local = threading.local()
+_global_lock  = threading.Lock()
+
 
 def get_conn() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA foreign_keys=ON")
-        _conn.execute("PRAGMA busy_timeout=5000")
-    return _conn
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        _thread_local.conn = conn
+    return conn
+
 
 def get_lock() -> threading.Lock:
-    return _lock
+    return _global_lock
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
@@ -80,16 +84,17 @@ SAMPLE_DATA = [
     ("P020", "Dove Body Lotion 200ml",     "Personal Care", "Moisturising body lotion, 200ml",                   265.0, 30),
 ]
 
+
 def init_db():
     conn = get_conn()
-    with _lock:
+    with _global_lock:
         conn.executescript(SCHEMA)
-        now = datetime.utcnow().isoformat()
+        ts = datetime.utcnow().isoformat()
         for row in SAMPLE_DATA:
             conn.execute(
                 """INSERT OR IGNORE INTO products
                    (product_id,name,category,description,price,quantity,updated_at)
                    VALUES (?,?,?,?,?,?,?)""",
-                (*row, now)
+                (*row, ts)
             )
         conn.commit()

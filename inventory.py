@@ -4,13 +4,13 @@ from db import get_conn, get_lock
 def search_products(query: str="", category: str="") -> list[dict]:
     conn = get_conn()
     lock = get_lock()
-    pattern = f"%{query.lower()}%"
+    pat = f"%{query.lower()}%"
     sql = """
         SELECT product_id, name, category, description, price, quantity, updated_at
         FROM products
         WHERE (LOWER(name) LIKE ? OR LOWER(description) LIKE ?)
     """
-    params: list = [pattern, pattern]
+    params: list = [pat, pat]
     if category:
         sql += " AND LOWER(category) = ?"
         params.append(category.lower())
@@ -19,12 +19,12 @@ def search_products(query: str="", category: str="") -> list[dict]:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
-def get_product(product_id: str) -> dict | None:
+def get_product(pid: str) -> dict | None:
     conn = get_conn()
     lock = get_lock()
     with lock:
         row = conn.execute(
-            "SELECT * FROM products WHERE product_id = ?", (product_id,)
+            "SELECT * FROM products WHERE product_id = ?", (pid,)
         ).fetchone()
     return dict(row) if row else None
 

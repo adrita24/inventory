@@ -1,6 +1,6 @@
 # Inventory Management RAG Chatbot
 
-A production-grade inventory management system with a conversational interface, built for correctness under concurrent load. The chatbot is an interface to a real backend -- all business logic, stock management, and transaction handling is implemented in Python and SQLite, not in the LLM.
+A production-grade inventory management system with a conversational interface, built for correctness under concurrent load. The chatbot is an interface to a real backend — all business logic, stock management, and transaction handling is implemented in Python and SQLite, not in the LLM.
 
 ---
 
@@ -81,7 +81,7 @@ SET quantity = quantity - N, version = version + 1
 WHERE product_id = ? AND version = ? AND quantity >= N
 ```
 
-If `rowcount == 0`, another writer committed between the read and this write. Retry with exponential backoff. Under high contention, retries exhaust and the user fails even when stock is available -- a spurious failure. This is acceptable for low-write workloads (e.g. view counters) but not for checkout.
+If `rowcount == 0`, another writer committed between the read and this write. Retry with exponential backoff. Under high contention, retries exhaust and the user fails even when stock is available — a spurious failure. This is acceptable for low-write workloads (e.g. view counters) but not for checkout.
 
 ### Isolation Level
 
@@ -148,19 +148,33 @@ User messages are classified into one of these intents before any backend call i
 |---|---|---|
 | search | "do you have detergent", "show dairy" | TF-IDF retrieval + keyword search |
 | list_all | "what products do you have" | Full catalog query |
-| stock_check | "how many X remain", "X quantity" | Direct product lookup |
-| add_to_cart | "add 3 amul butter" | cart.add_to_cart |
-| remove_from_cart | "remove tomatoes", "remove 2 units" | cart.remove_from_cart |
-| clear_cart | "clear my cart", "empty cart" | cart.clear_cart |
-| view_cart | "what's in my cart" | cart.view_cart |
-| place_order | "buy all", "checkout" | orders.place_order (locked) |
-| order_history | "show my orders" | orders.get_order_history |
-| unsupported | "buy all except X" | Rejected with explanation |
+| add_to_cart | "add 3 amul butter", "add 2 coke and 1 redbull" | `cart.add_to_cart()` |
+| add_all | "add everything to cart", "buy the whole inventory" | `cart.add_to_cart()` for each product |
+| add_category | "add all dairy", "get me 2 of every snack" | `cart.add_to_cart()` filtered by category |
+| remove_from_cart | "remove tomatoes", "remove 2 spinach" | `cart.remove_from_cart()` / `cart.reduce_cart_quantity()` |
+| reduce_all | "remove 2 of each", "reduce all by 3" | `cart.reduce_cart_quantity()` for all cart items |
+| clear_cart | "clear my cart", "empty cart" | `cart.clear_cart()` |
+| view_cart | "what's in my cart" | `cart.view_cart()` |
+| place_order | "buy all", "checkout" | `orders.place_order()` (locked) |
+| order_history | "show my orders" | `orders.get_order_history()` |
+| unsupported | "buy all except X", "my budget is 500" | Rejected with explanation |
 | chitchat | anything else | LLM response only |
 
-For all transactional intents (add, remove, clear, view, place, history), the backend result is returned verbatim to the user. The LLM is not in the response path for these -- it cannot hallucinate prices or quantities.
+For all transactional intents (add, remove, clear, view, place, history), the backend result is returned verbatim to the user. The LLM is not in the response path for these — it cannot hallucinate prices or quantities.
 
-For vague removes ("remove 2 units" with no product named), the system resolves the product from the last item in the session cart.
+For vague removes ("remove 2 units" with no product named), the system resolves the product from the last item in the session cart. For ambiguous affirmatives ("yes"), the system checks conversation history: if the previous bot turn mentioned specific products, those are added rather than triggering `add_all`.
+
+---
+
+## Product Resolution
+
+`_resolve_product()` in `agent.py` handles fuzzy product matching in three stages:
+
+1. **Explicit query** — tokenises the query, applies a synonym map (e.g. `coke → coca cola`, `palak → spinach`), scores RAG + keyword candidates, then falls back to full-inventory scoring if no confident match is found.
+2. **Empty query** — scans recent conversation history for any product name mentioned by either party.
+3. **Cart fallback** — for remove/update contexts, uses the last item in the session cart.
+
+Scoring weights: exact token match in name/category (4 pts) > description match (3 pts) > prefix match in name (2 pts) > prefix match in description (1 pt).
 
 ---
 
@@ -169,13 +183,15 @@ For vague removes ("remove 2 units" with no product named), the system resolves 
 ```
 inventory_rag_chatbot/
     app.py                  Streamlit frontend, session management, sidebar cart view
-    agent.py                Intent classifier + deterministic dispatch
+    agent.py                Intent classifier + deterministic dispatch + product resolution
     rag.py                  TF-IDF vector store (sklearn), product retrieval
     db.py                   SQLite connection, WAL config, schema, sample data
     inventory.py            Read-only product queries
     cart.py                 Session-scoped cart CRUD
     orders.py               Checkout with BEGIN IMMEDIATE transaction
     concurrency_test.py     Race condition demonstration, both locking strategies
+    test_zapmart.py         Unit + concurrency test suite (pytest)
+    reset_demo.py           CLI utility to reset a product's stock and version
     requirements.txt        Python dependencies
     inventory.db            Auto-created on first run, do not commit
 ```
@@ -210,11 +226,21 @@ Run the concurrency test:
 python concurrency_test.py
 ```
 
+Run the test suite:
+```
+pytest test_zapmart.py -v
+```
+
+Reset a product's stock for a fresh demo run:
+```
+python reset_demo.py P016 5
+```
+
 ---
 
 ## Concurrency Test
 
-The test script demonstrates race condition prevention with configurable parameters at the top of the file:
+`concurrency_test.py` demonstrates race condition prevention with configurable parameters at the top of the file:
 
 ```python
 NUM_USERS       = 6    # concurrent users attempting purchase
@@ -230,7 +256,7 @@ orders recorded == units deducted from stock
 remaining stock >= 0
 ```
 
-If either invariant breaks, the script raises AssertionError. It has not.
+If either invariant breaks, the script raises `AssertionError`. It has not.
 
 ---
 
@@ -242,5 +268,5 @@ If either invariant breaks, the script raises AssertionError. It has not.
 | Vector retrieval | TF-IDF + cosine similarity (scikit-learn) |
 | Database | SQLite with WAL mode |
 | Frontend | Streamlit |
-| Concurrency | threading.Lock + BEGIN IMMEDIATE + optimistic CAS |
+| Concurrency | `threading.Lock` + `BEGIN IMMEDIATE` + optimistic CAS |
 | Language | Python 3.10+ |

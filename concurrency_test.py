@@ -8,7 +8,6 @@ from db import init_db, get_conn, get_lock, DB_PATH
 from cart import ensure_session, add_to_cart
 from orders import place_order
 
-# tweak these before each demo run
 NUM_USERS       = 6
 STOCK_QTY       = 5
 TARGET_QTY_EACH = 1
